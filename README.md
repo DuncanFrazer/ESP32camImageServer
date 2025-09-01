@@ -1,1 +1,3 @@
 # ESPcamImageServer
+
+I had to move the ESP32 board support in Arduino IDE down to 2.0.17 to get my board to work, and I have use 10MHhz clocking of the camera sensor, 20Mhz didn't work at all for me. Use the serial monitor to see the IP address assigned to the ESP32, browse to it on the network and you'll see the image stream at around 5fps plus some controls to set the "torch" white LED on/off/brightness
