@@ -21,33 +21,46 @@
 #define PCLK_GPIO_NUM     22
 
 // ---- Onboard white LED (flash) ----
-#define LED_PIN           4
-#define LED_ACTIVE_HIGH   1   // flip to 0 if your LED is inverted
+static int  LED_PIN = 4;              // white flash LED
+static bool LED_ACTIVE_HIGH = true;   // can be flipped at runtime
+static int  LED_DUTY = 25;        // max brightness
+
+// Pick a timer/channel FAR from camera (camera uses LEDC_TIMER_0 / CHANNEL_0)
+static const int LEDC_CH    = 7;      // free channel
+static const int LEDC_TIMER = 3;      // free timer
+static const int LEDC_FREQ  = 5000;   // 5 kHz
+static const int LEDC_BITS  = 8;      // 0..255
 
 WiFiServer server(80);
+WiFiClient streamClient;
+bool streamActive = false;
+bool streamHdrSent = false;
 
-// ===== LEDC (PWM) for LED brightness =====
-static const int LEDC_CHANNEL = 2;
-static const int LEDC_TIMER   = 2;
-static const int LEDC_FREQ    = 5000;  // 5 kHz
-static const int LEDC_BITS    = 8;     // 0..255 duty
-
-static inline void led_setup() {
-  ledcSetup(LEDC_CHANNEL, LEDC_FREQ, LEDC_BITS);
-  ledcAttachPin(LED_PIN, LEDC_CHANNEL);
-  // start off
-  ledcWrite(LEDC_CHANNEL, LED_ACTIVE_HIGH ? 0 : 255);
+static void led_detach() {
+  ledcDetachPin(LED_PIN);
+  pinMode(LED_PIN, OUTPUT);
 }
 
-static inline void led_set_on(bool on) {
-  uint8_t duty = on ? 255 : 0;
-  if (!LED_ACTIVE_HIGH) duty = 255 - duty;
-  ledcWrite(LEDC_CHANNEL, duty);
+static void led_attach() {
+  ledcSetup(LEDC_CH, LEDC_FREQ, LEDC_BITS);  // timer 3
+  ledcAttachPin(LED_PIN, LEDC_CH);
 }
 
-static inline void led_set_duty(uint8_t duty) {
+static void led_write_duty(uint8_t duty) {   // 0..255
   uint8_t out = LED_ACTIVE_HIGH ? duty : (255 - duty);
-  ledcWrite(LEDC_CHANNEL, out);
+  ledcWrite(LEDC_CH, out);
+}
+
+static void led_off() { led_write_duty(0); }
+static void led_on()  { led_write_duty(LED_DUTY); }
+
+// Recovery for “stuck LED”
+static void led_recover() {
+  led_detach();
+  digitalWrite(LED_PIN, LED_ACTIVE_HIGH ? LOW : HIGH); // force OFF as GPIO
+  delay(10);
+  led_attach();
+  led_off();
 }
 
 // ----- HTTP helpers -----
@@ -140,9 +153,6 @@ void setup() {
   Serial.begin(115200);
   delay(200);
 
-  // LED PWM init (keeps LED off at boot)
-  led_setup();
-
   // ---- Camera (stable profile) ----
   camera_config_t config;
   config.ledc_channel = LEDC_CHANNEL_0;
@@ -166,18 +176,22 @@ void setup() {
 
   config.xclk_freq_hz = 10000000;           // 10 MHz (your stable setting)
   config.pixel_format = PIXFORMAT_JPEG;
-  config.frame_size   = FRAMESIZE_VGA;      // currently stable for you
+  config.frame_size   = FRAMESIZE_SVGA;      // currently stable for you
   config.jpeg_quality = 15;
   config.fb_count     = 1;
   config.grab_mode    = CAMERA_GRAB_LATEST;
   config.fb_location  = (psramFound() ? CAMERA_FB_IN_PSRAM : CAMERA_FB_IN_DRAM);
 
+  pinMode(LED_PIN, OUTPUT);
+  digitalWrite(LED_PIN, LED_ACTIVE_HIGH ? LOW : HIGH); // make sure it's OFF
   esp_err_t err = esp_camera_init(&config);
   if (err != ESP_OK) {
     Serial.printf("Camera init failed: 0x%x\n", err);
     for(;;) delay(1000);
   }
   Serial.println("Camera init OK");
+  led_attach();
+  led_on();
 
   WiFi.setSleep(false);
   WiFi.begin(WIFI_SSID, WIFI_PASS);
@@ -191,56 +205,116 @@ void setup() {
 }
 
 void loop() {
+  bool isStreamRequest = false;
   WiFiClient client = server.available();
-  if (!client) return;
+  bool haveClient = (bool)client;   // proceed only if a new client connected
 
-  // Read request line (method + path)
-  String line = client.readStringUntil('\r');
-  client.readStringUntil('\n'); // consume LF
+  if (haveClient) {
+    String line = client.readStringUntil('\r');
+    client.readStringUntil('\n');
 
-  if (line.startsWith("GET / ")) {
-    sendHtml(client, htmlPage(WiFi.localIP()));
+    bool isStreamRequest = false;
 
-  } else if (line.startsWith("GET /jpg")) {
-    sendJpeg(client);
+    if (line.startsWith("GET / ")) {
+      sendHtml(client, htmlPage(WiFi.localIP()));
 
-  } else if (line.startsWith("GET /stream")) {
-    streamMjpeg(client);
+    } else if (line.startsWith("GET /jpg")) {
+      sendJpeg(client);
 
-  } else if (line.startsWith("GET /led/on")) {
-    led_set_on(true);
-    sendPlain(client, "LED ON\n");
+    } else if (line.startsWith("GET /stream")) {
+      streamClient = client; // keep this socket for streaming
+      streamClient.setNoDelay(true);
+      streamActive = true;
+      streamHdrSent = false;
+      isStreamRequest = false;
+      // IMPORTANT: do NOT call client.stop() here
 
-  } else if (line.startsWith("GET /led/off")) {
-    led_set_on(false);
-    sendPlain(client, "LED OFF\n");
+    } else if (line.startsWith("GET /led/recover")) {
+      led_recover();
+      sendPlain(client, "LED recovered (PWM reset)\n");
+    } else if (line.startsWith("GET /led/on")) {
+      led_on();
+      sendPlain(client, "LED ON\n");
 
-  } else if (line.startsWith("GET /led?")) {
-    int q = line.indexOf("duty=");
-    if (q >= 0) {
-      int amp = line.indexOf('&', q);
-      String val = (amp > 0 ? line.substring(q+5, amp) : line.substring(q+5));
-      val.trim();
-      int duty = val.toInt();
-      duty = constrain(duty, 0, 255);
-      led_set_duty((uint8_t)duty);
-      sendPlain(client, String("LED duty set to ") + duty + "\n");
-    } else {
-      sendPlain(client, "Usage: /led?duty=0..255\n");
+    } else if (line.startsWith("GET /led/off")) {
+      led_off();
+      sendPlain(client, "LED OFF\n");
     }
 
-  } else {
-    // Fallback help
-    sendPlain(client,
-      "OK\n\n"
-      "Endpoints:\n"
-      "  /               - HTML control page\n"
-      "  /jpg            - single JPEG\n"
-      "  /stream         - MJPEG stream\n"
-      "  /led/on         - LED on (full)\n"
-      "  /led/off        - LED off\n"
-      "  /led?duty=0..255- LED brightness\n");
+    // /led?duty=N    -> PWM brightness
+    else if (line.startsWith("GET /led?")) {
+      int q = line.indexOf("duty=");
+      if (q >= 0) {
+        int amp = line.indexOf('&', q);
+        String val = (amp > 0 ? line.substring(q+5, amp) : line.substring(q+5));
+        val.trim();
+        int duty = constrain(val.toInt(), 0, 255);
+        led_write_duty((uint8_t)duty);
+        LED_DUTY = duty;
+        sendPlain(client, String("LED duty set to ") + duty + "\n");
+      } else {
+        sendPlain(client, "Usage: /led?duty=0..255\n");
+      }
+    }
+    // /led/polarity?active=high|low  -> runtime polarity flip
+    else if (line.startsWith("GET /led/polarity")) {
+      bool newActiveHigh = LED_ACTIVE_HIGH;
+      int q = line.indexOf("active=");
+      if (q >= 0) {
+        String val = line.substring(q+7);
+        int sp = val.indexOf(' ');
+        if (sp > 0) val = val.substring(0, sp);
+        val.trim();
+        if (val == "high") newActiveHigh = true;
+        else if (val == "low") newActiveHigh = false;
+      }
+      LED_ACTIVE_HIGH = newActiveHigh;
+      led_off(); // re-apply OFF with new polarity
+      sendPlain(client, String("Polarity set to ") + (LED_ACTIVE_HIGH ? "active-high\n" : "active-low\n"));
+    }
+    else {
+      // Fallback help
+      sendPlain(client,
+        "OK\n\n"
+        "Endpoints:\n"
+        "  /               - HTML control page\n"
+        "  /jpg            - single JPEG\n"
+        "  /stream         - MJPEG stream\n"
+        "  /led/on         - LED on (full)\n"
+        "  /led/off        - LED off\n"
+        "  /led?duty=0..255- LED brightness\n");
+    }
   }
 
-  client.stop();
+  // send one frame to the active stream client per loop iteration
+  if (streamActive) {
+    if (!streamClient.connected()) {
+      streamClient.stop();
+      streamActive = false;
+      streamHdrSent = false;
+    } else {
+      if (!streamHdrSent) {
+        streamClient.print(
+        "HTTP/1.1 200 OK\r\n"
+        "Content-Type: multipart/x-mixed-replace; boundary=frame\r\n"
+        "Cache-Control: no-store\r\n"
+        "Connection: close\r\n\r\n"
+        );
+        streamHdrSent = true;
+      }
+      camera_fb_t* fb = esp_camera_fb_get();
+      if (fb) {
+        streamClient.print("--frame\r\n");
+        streamClient.printf("Content-Type: image/jpeg\r\nContent-Length: %u\r\n\r\n", fb->len);
+        streamClient.write(fb->buf, fb->len);
+        streamClient.print("\r\n");
+        esp_camera_fb_return(fb);
+      }
+      delay(40); // adjust 20-80ms for frame rate
+    }
+  }
+
+  if (!isStreamRequest) {
+    client.stop();   // close normal requests
+  }
 }
