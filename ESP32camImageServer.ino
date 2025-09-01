@@ -1,5 +1,6 @@
 #include <WiFi.h>
 #include "esp_camera.h"
+#include "secrets.h"  // WIFI_SSID and WIFI_PASS
 
 // ==== AI Thinker ESP32-CAM (OV2640) pin map ====
 #define PWDN_GPIO_NUM     32
@@ -22,10 +23,6 @@
 // ---- Onboard white LED (flash) ----
 #define LED_PIN           4
 #define LED_ACTIVE_HIGH   1   // flip to 0 if your LED is inverted
-
-// ---- Wi-Fi ----
-const char* SSID = "YOUR_SSID";
-const char* PASS = "YOUR_PASS";
 
 WiFiServer server(80);
 
@@ -183,7 +180,7 @@ void setup() {
   Serial.println("Camera init OK");
 
   WiFi.setSleep(false);
-  WiFi.begin(SSID, PASS);
+  WiFi.begin(WIFI_SSID, WIFI_PASS);
   Serial.print("Wi-Fi connecting");
   for (int i=0; i<60 && WiFi.status()!=WL_CONNECTED; ++i) { delay(250); Serial.print("."); }
   Serial.println();
