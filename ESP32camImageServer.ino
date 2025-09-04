@@ -23,7 +23,7 @@
 // ---- Onboard white LED (flash) ----
 static int  LED_PIN = 4;              // white flash LED
 static bool LED_ACTIVE_HIGH = true;   // can be flipped at runtime
-static int  LED_DUTY = 25;        // max brightness
+static int  LED_DUTY = 25;
 
 // Pick a timer/channel FAR from camera (camera uses LEDC_TIMER_0 / CHANNEL_0)
 static const int LEDC_CH    = 7;      // free channel
@@ -174,9 +174,9 @@ void setup() {
   config.pin_pwdn     = PWDN_GPIO_NUM;
   config.pin_reset    = RESET_GPIO_NUM;
 
-  config.xclk_freq_hz = 10000000;           // 10 MHz (your stable setting)
+  config.xclk_freq_hz = 10000000;           // 20 MHz didn't work on my cheap board from aliexpress
   config.pixel_format = PIXFORMAT_JPEG;
-  config.frame_size   = FRAMESIZE_SVGA;      // currently stable for you
+  config.frame_size   = FRAMESIZE_SVGA;
   config.jpeg_quality = 15;
   config.fb_count     = 1;
   config.grab_mode    = CAMERA_GRAB_LATEST;
@@ -256,7 +256,6 @@ void loop() {
         sendPlain(client, "Usage: /led?duty=0..255\n");
       }
     }
-    // /led/polarity?active=high|low  -> runtime polarity flip
     else if (line.startsWith("GET /led/polarity")) {
       bool newActiveHigh = LED_ACTIVE_HIGH;
       int q = line.indexOf("active=");
